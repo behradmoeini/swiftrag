@@ -4,7 +4,13 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.1] - 2026-06-15
+
+### Fixed
+- Python 3.9 compatibility: dataclass `slots=True` is now applied only on 3.10 and later.
+
+### Changed
+- Rewrote the README, package description, and docstrings in a plainer style.
 
 ### Added
 - GitHub Actions CI (lint and test matrix across Python 3.9 to 3.12 on Linux, macOS, and Windows).

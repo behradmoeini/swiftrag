@@ -31,7 +31,7 @@ from .exceptions import (
 from .llms import AnthropicLLM, CallableLLM, EchoLLM, LLMProvider, OpenAILLM
 from .types import Chunk, Document, RAGResponse, ScoredChunk
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "RAG",
