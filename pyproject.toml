@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swiftrag"
+version = "0.1.0"
+description = "Set up retrieval-augmented generation from your own text in one call. Pass your documents and a model, and get a RAG-backed LLM."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Behrad Moeini" }]
+keywords = [
+    "rag",
+    "retrieval-augmented-generation",
+    "llm",
+    "embeddings",
+    "vector-search",
+    "openai",
+    "ai",
+    "nlp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+# Core stays intentionally tiny. numpy is the only hard runtime dependency so
+# the package installs in seconds and works fully offline (hash embeddings +
+# echo LLM) with zero API keys.
+dependencies = [
+    "numpy>=1.21",
+]
+
+[project.optional-dependencies]
+openai = ["openai>=1.0"]
+anthropic = ["anthropic>=0.25"]
+local = ["sentence-transformers>=2.2"]
+faiss = ["faiss-cpu>=1.7"]
+tokenize = ["tiktoken>=0.5"]
+# Everything you might want, in one shot.
+all = [
+    "openai>=1.0",
+    "anthropic>=0.25",
+    "sentence-transformers>=2.2",
+    "faiss-cpu>=1.7",
+    "tiktoken>=0.5",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/behradmoeini/swiftrag"
+Repository = "https://github.com/behradmoeini/swiftrag"
+Issues = "https://github.com/behradmoeini/swiftrag/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swiftrag"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/swiftrag", "README.md", "LICENSE", "tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
