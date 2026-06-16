@@ -29,6 +29,7 @@ from .exceptions import (
     SwiftRagError,
 )
 from .llms import AnthropicLLM, CallableLLM, EchoLLM, LLMProvider, OpenAILLM
+from .loaders import html_to_text, load_docx, load_file, load_html, load_pdf, load_url
 from .types import Chunk, Document, RAGResponse, ScoredChunk
 
 __version__ = "0.1.1"
@@ -54,5 +55,11 @@ __all__ = [
     "ConfigurationError",
     "DependencyError",
     "EmptyCorpusError",
+    "load_file",
+    "load_pdf",
+    "load_docx",
+    "load_html",
+    "load_url",
+    "html_to_text",
     "__version__",
 ]

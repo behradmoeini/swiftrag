@@ -3,7 +3,7 @@
 [![CI](https://github.com/behradmoeini/swiftrag/actions/workflows/ci.yml/badge.svg)](https://github.com/behradmoeini/swiftrag/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/swiftrag.svg)](https://pypi.org/project/swiftrag/)
 [![Python versions](https://img.shields.io/pypi/pyversions/swiftrag.svg)](https://pypi.org/project/swiftrag/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/behradmoeini/swiftrag/blob/main/LICENSE)
 
 swiftrag sets up a retrieval-augmented generation (RAG) pipeline from your own text in one call. You pass your documents and a model, and it handles the chunking, embedding, vector search, retrieval, and prompt building.
 
@@ -38,6 +38,7 @@ pip install swiftrag                 # core (numpy only), works offline
 pip install "swiftrag[openai]"       # OpenAI embeddings and LLM
 pip install "swiftrag[anthropic]"    # Claude LLM
 pip install "swiftrag[local]"        # local sentence-transformers embeddings
+pip install "swiftrag[loaders]"      # PDF, DOCX, and richer HTML/URL loading
 pip install "swiftrag[faiss]"        # FAISS backend for big corpora
 pip install "swiftrag[all]"          # everything
 ```
@@ -57,15 +58,33 @@ RAG(documents=text, embedding_model="local:all-MiniLM-L6-v2", llm_model="anthrop
 RAG(documents=text)
 ```
 
-### Build straight from files or a folder
+### Build straight from files, PDFs, or the web
 
 ```python
+# Folders and plain-text files work out of the box.
 rag = RAG.from_files("docs/", embedding_model="openai:text-embedding-3-small")
 # each file becomes a document tagged with metadata={"source": <path>}
 
 resp = rag.query("What's our deployment process?")
 print(resp.answer)
 print(resp.format_sources())   # numbered, readable citations
+```
+
+`from_files` also reads PDF, DOCX, and HTML when you install the loaders extra
+(`pip install "swiftrag[loaders]"`); HTML works even without it via a stdlib
+fallback. You can also pull straight from the web:
+
+```python
+# Mixed folder: .txt/.md/.pdf/.docx/.html are all picked up and parsed.
+rag = RAG.from_files(["handbook.pdf", "notes/", "page.html"])
+
+# Fetch and index web pages (or PDF URLs).
+rag = RAG.from_url("https://example.com/docs", llm_model="openai:gpt-4o-mini")
+
+# Use a single loader directly if you want the raw text.
+from swiftrag import load_pdf, load_url
+text = load_pdf("handbook.pdf")
+text = load_url("https://example.com")
 ```
 
 ### Documents can be a string, a list, or dicts with metadata
@@ -171,4 +190,4 @@ ruff check .
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/behradmoeini/swiftrag/blob/main/LICENSE).

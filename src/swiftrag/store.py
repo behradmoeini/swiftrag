@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 
+from .lexical import BM25
 from .types import Chunk, ScoredChunk
 
 Predicate = Callable[[Chunk], bool]
@@ -39,6 +40,7 @@ class VectorStore:
         self._matrix: np.ndarray | None = None  # (n, dim) normalized float32
         self._use_faiss = use_faiss
         self._faiss_index = None
+        self._bm25: BM25 | None = None  # lazily (re)built for hybrid search
 
     def __len__(self) -> int:
         return len(self._chunks)
@@ -48,6 +50,7 @@ class VectorStore:
         self._chunks = []
         self._matrix = None
         self._faiss_index = None
+        self._bm25 = None
 
     @property
     def dim(self) -> int | None:
@@ -63,6 +66,7 @@ class VectorStore:
         for chunk, vec in zip(chunks, normalized):
             chunk.embedding = vec
         self._chunks.extend(chunks)
+        self._bm25 = None  # corpus changed; rebuild lexical index on next hybrid query
 
         if self._matrix is None:
             self._matrix = normalized
@@ -94,6 +98,9 @@ class VectorStore:
         candidate_pool: int = 20,
         min_score: float | None = None,
         predicate: Predicate | None = None,
+        hybrid: bool = False,
+        query_text: str | None = None,
+        rrf_k: int = 60,
     ) -> list[ScoredChunk]:
         if self._matrix is None or len(self._chunks) == 0:
             return []
@@ -105,11 +112,17 @@ class VectorStore:
 
         top_k = min(top_k, len(self._chunks))
 
-        # FAISS can't express metadata filters / MMR, so fall back to the
-        # brute-force path (still a single BLAS matmul) when those are requested.
-        use_faiss = self._faiss_index is not None and not mmr and predicate is None
+        # FAISS can't express metadata filters / MMR / hybrid, so fall back to
+        # the brute-force path (still a single BLAS matmul) when those are used.
+        use_faiss = (
+            self._faiss_index is not None and not mmr and not hybrid and predicate is None
+        )
 
-        if mmr:
+        if hybrid:
+            results = self._search_hybrid(
+                q, query_text or "", top_k, candidate_pool, predicate, rrf_k
+            )
+        elif mmr:
             results = self._search_mmr(q, top_k, mmr_lambda, candidate_pool, predicate)
         elif use_faiss:
             scores, idx = self._faiss_index.search(q.reshape(1, -1), top_k)
@@ -183,6 +196,50 @@ class VectorStore:
             selected_mask[pick] = True
 
         return [ScoredChunk(self._chunks[cand[i]], float(cand_sims[i])) for i in selected]
+
+    def _search_hybrid(
+        self,
+        q: np.ndarray,
+        query_text: str,
+        top_k: int,
+        pool: int,
+        predicate: Predicate | None,
+        rrf_k: int,
+    ) -> list[ScoredChunk]:
+        """Fuse dense (cosine) and BM25 (lexical) rankings via Reciprocal Rank Fusion.
+
+        The reported ``score`` stays the dense cosine similarity so ``min_score``
+        and downstream consumers keep a consistent, interpretable meaning; only
+        the *ordering* reflects the fused dense+lexical signal.
+        """
+        dense = self._matrix @ q
+        if predicate is not None:
+            dense = self._apply_predicate(dense, predicate)
+
+        if self._bm25 is None:
+            self._bm25 = BM25([c.text for c in self._chunks])
+        lexical = self._bm25.scores(query_text)
+        if predicate is not None:
+            # Drop predicate-filtered docs from the lexical ranking too.
+            lexical = np.where(np.isfinite(dense), lexical, 0.0)
+
+        pool = min(max(pool, top_k), len(self._chunks))
+
+        dense_rank = self._top_k_indices(dense, pool)
+        dense_rank = [i for i in dense_rank if np.isfinite(dense[i])]
+        lex_rank = self._top_k_indices(lexical, pool)
+        lex_rank = [i for i in lex_rank if lexical[i] > 0.0]
+
+        fused: dict[int, float] = {}
+        for rank, idx in enumerate(dense_rank):
+            fused[idx] = fused.get(idx, 0.0) + 1.0 / (rrf_k + rank)
+        for rank, idx in enumerate(lex_rank):
+            fused[idx] = fused.get(idx, 0.0) + 1.0 / (rrf_k + rank)
+
+        if not fused:
+            return []
+        order = sorted(fused, key=lambda i: fused[i], reverse=True)[:top_k]
+        return [ScoredChunk(self._chunks[i], float(dense[i])) for i in order]
 
 
 __all__ = ["VectorStore"]

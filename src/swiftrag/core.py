@@ -18,7 +18,12 @@ import numpy as np
 
 from .chunking import chunk_documents, count_tokens
 from .embeddings import EmbeddingProvider, resolve_embeddings
-from .exceptions import ConfigurationError, EmptyCorpusError
+from .exceptions import (
+    ConfigurationError,
+    DependencyError,
+    EmptyCorpusError,
+    SwiftRagError,
+)
 from .llms import LLMProvider, resolve_llm
 from .store import VectorStore
 from .types import Chunk, Document, RAGResponse, ScoredChunk
@@ -121,11 +126,13 @@ class RAG:
         top_k: int = 4,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         use_mmr: bool = False,
+        use_hybrid: bool = False,
         use_faiss: bool = False,
         min_score: float | None = None,
         max_context_tokens: int | None = None,
         dedup: bool = True,
         query_cache_size: int = 128,
+        reranker: Callable[[str, list[ScoredChunk]], list[ScoredChunk]] | None = None,
         embedding_kwargs: dict[str, Any] | None = None,
         llm_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -147,6 +154,8 @@ class RAG:
         self.top_k = top_k
         self.system_prompt = system_prompt
         self.use_mmr = use_mmr
+        self.use_hybrid = use_hybrid
+        self.reranker = reranker
         self.min_score = min_score
         self.max_context_tokens = max_context_tokens
         self.dedup = dedup
@@ -207,16 +216,19 @@ class RAG:
         -------
         >>> rag = RAG.from_files("docs/", embedding_model="openai:text-embedding-3-small")
         """
+        from .loaders import EXTENSION_LOADERS, load_file
+
         if isinstance(paths, (str, Path)):
             paths = [paths]
 
+        supported = _TEXT_EXTENSIONS | set(EXTENSION_LOADERS)
         files: list[Path] = []
         for raw in paths:
             p = Path(raw)
             if p.is_dir():
                 files.extend(
                     f for f in sorted(p.glob(glob))
-                    if f.is_file() and f.suffix.lower() in _TEXT_EXTENSIONS
+                    if f.is_file() and f.suffix.lower() in supported
                 )
             elif p.is_file():
                 files.append(p)
@@ -226,14 +238,47 @@ class RAG:
         documents: list[Document] = []
         for f in files:
             try:
-                text = f.read_text(encoding=encoding)
-            except (UnicodeDecodeError, OSError) as exc:
+                text = load_file(f, encoding=encoding)
+            except DependencyError:
+                raise  # missing optional parser is actionable; surface it
+            except (UnicodeDecodeError, OSError, SwiftRagError) as exc:
                 logger.warning("Skipping %s: %s", f, exc)
                 continue
             if text.strip():
                 documents.append(Document(text=text, metadata={"source": str(f)}))
 
         logger.debug("from_files loaded %d documents from %d paths", len(documents), len(files))
+        return cls(documents=documents, **kwargs)
+
+    @classmethod
+    def from_url(
+        cls,
+        urls: str | Sequence[str],
+        *,
+        timeout: float = 30.0,
+        **kwargs,
+    ) -> RAG:
+        """Build a :class:`RAG` from one or more web pages (or PDF URLs).
+
+        Each URL is fetched and reduced to text, then tagged with
+        ``metadata={"source": <url>}``. HTML works with no extra dependencies;
+        PDF URLs require ``pypdf`` (``pip install 'swiftrag[loaders]'``).
+
+        Example
+        -------
+        >>> rag = RAG.from_url("https://example.com", llm_model="openai:gpt-4o-mini")
+        """
+        from .loaders import load_url
+
+        urls = [urls] if isinstance(urls, str) else list(urls)
+
+        documents: list[Document] = []
+        for url in urls:
+            text = load_url(url, timeout=timeout)
+            if text.strip():
+                documents.append(Document(text=text, metadata={"source": url}))
+
+        logger.debug("from_url loaded %d documents from %d urls", len(documents), len(urls))
         return cls(documents=documents, **kwargs)
 
     def clear(self) -> RAG:

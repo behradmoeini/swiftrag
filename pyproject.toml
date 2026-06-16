@@ -48,6 +48,8 @@ anthropic = ["anthropic>=0.25"]
 local = ["sentence-transformers>=2.2"]
 faiss = ["faiss-cpu>=1.7"]
 tokenize = ["tiktoken>=0.5"]
+# Document loaders for PDF, DOCX, and richer HTML extraction.
+loaders = ["pypdf>=4.0", "python-docx>=1.1", "beautifulsoup4>=4.12"]
 # Everything you might want, in one shot.
 all = [
     "openai>=1.0",
@@ -55,6 +57,9 @@ all = [
     "sentence-transformers>=2.2",
     "faiss-cpu>=1.7",
     "tiktoken>=0.5",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "beautifulsoup4>=4.12",
 ]
 dev = [
     "pytest>=7.0",
