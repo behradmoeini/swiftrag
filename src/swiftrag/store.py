@@ -76,6 +76,31 @@ class VectorStore:
         if self._use_faiss:
             self._build_faiss()
 
+    def delete(self, predicate: Predicate) -> int:
+        """Remove every chunk for which ``predicate`` returns True.
+
+        Returns the number of chunks removed. The embedding matrix and any
+        lexical/FAISS indexes are rebuilt to match.
+        """
+        if not self._chunks:
+            return 0
+        keep = [i for i, c in enumerate(self._chunks) if not predicate(c)]
+        removed = len(self._chunks) - len(keep)
+        if removed == 0:
+            return 0
+
+        self._chunks = [self._chunks[i] for i in keep]
+        if keep and self._matrix is not None:
+            self._matrix = np.ascontiguousarray(self._matrix[keep])
+        else:
+            self._matrix = None
+
+        self._bm25 = None  # lexical index is rebuilt lazily on next hybrid query
+        self._faiss_index = None
+        if self._use_faiss and self._matrix is not None:
+            self._build_faiss()
+        return removed
+
     def _build_faiss(self) -> None:
         try:
             import faiss

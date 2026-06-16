@@ -12,7 +12,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Union
+from typing import TYPE_CHECKING, Any, Union
 
 import numpy as np
 
@@ -27,6 +27,9 @@ from .exceptions import (
 from .llms import LLMProvider, resolve_llm
 from .store import VectorStore
 from .types import Chunk, Document, RAGResponse, ScoredChunk
+
+if TYPE_CHECKING:
+    from .chat import Conversation
 
 logger = logging.getLogger("swiftrag")
 
@@ -133,6 +136,8 @@ class RAG:
         dedup: bool = True,
         query_cache_size: int = 128,
         reranker: Callable[[str, list[ScoredChunk]], list[ScoredChunk]] | None = None,
+        on_retrieve: Callable[[str, list[ScoredChunk]], None] | None = None,
+        on_generate: Callable[[str, str, dict[str, Any]], None] | None = None,
         embedding_kwargs: dict[str, Any] | None = None,
         llm_kwargs: dict[str, Any] | None = None,
     ) -> None:
@@ -156,6 +161,8 @@ class RAG:
         self.use_mmr = use_mmr
         self.use_hybrid = use_hybrid
         self.reranker = reranker
+        self.on_retrieve = on_retrieve
+        self.on_generate = on_generate
         self.min_score = min_score
         self.max_context_tokens = max_context_tokens
         self.dedup = dedup
@@ -288,6 +295,34 @@ class RAG:
         self._query_cache.clear()
         return self
 
+    def delete(self, where: Where) -> int:
+        """Delete indexed chunks matching ``where``; returns the number removed.
+
+        ``where`` is a metadata dict (exact ``key == value`` matches) or a
+        ``Chunk -> bool`` predicate, e.g. ``rag.delete({"source": "old.pdf"})``.
+        """
+        predicate = _make_predicate(where)
+        if predicate is None:
+            raise ConfigurationError(
+                "delete() requires a `where` filter (a dict or a Chunk -> bool callable). "
+                "Use clear() to remove everything."
+            )
+        removed = self.store.delete(predicate)
+        if removed:
+            self._seen_hashes = {_text_hash(c.text) for c in self.store._chunks}
+            self._query_cache.clear()
+        logger.debug("Deleted %d chunks (total=%d)", removed, len(self.store))
+        return removed
+
+    def update(self, documents: DocsInput, *, where: Where) -> RAG:
+        """Replace chunks matching ``where`` with freshly indexed ``documents``.
+
+        Convenience for :meth:`delete` followed by :meth:`add`; returns ``self``
+        for chaining.
+        """
+        self.delete(where)
+        return self.add(documents)
+
     def _embed_query_cached(self, question: str) -> np.ndarray:
         if self._query_cache_size == 0:
             return self.embedder.embed_query(question)
@@ -302,6 +337,16 @@ class RAG:
         return vec
 
     # --------------------------------------------------------------- retrieval
+    @staticmethod
+    def _safe_callback(cb, *args) -> None:
+        """Invoke an observability hook without letting it break the pipeline."""
+        if cb is None:
+            return
+        try:
+            cb(*args)
+        except Exception:  # hooks are best-effort; never fail a query because of one
+            logger.warning("swiftrag: callback raised; ignoring", exc_info=True)
+
     def _maybe_rerank(
         self, question: str, results: list[ScoredChunk], top_k: int
     ) -> list[ScoredChunk]:
@@ -343,7 +388,9 @@ class RAG:
             hybrid=self.use_hybrid if hybrid is None else hybrid,
             query_text=question,
         )
-        return self._maybe_rerank(question, results, effective_k)
+        results = self._maybe_rerank(question, results, effective_k)
+        self._safe_callback(self.on_retrieve, question, results)
+        return results
 
     # -------------------------------------------------------------- generation
     def _fit_to_budget(self, sources: list[ScoredChunk]) -> list[ScoredChunk]:
@@ -386,7 +433,9 @@ class RAG:
         )
         messages = self._build_messages(question, sources)
         answer = self.llm.generate(messages, **llm_kwargs)
-        return RAGResponse(answer=answer, sources=sources, query=question)
+        usage = dict(getattr(self.llm, "last_usage", None) or {})
+        self._safe_callback(self.on_generate, question, answer, usage)
+        return RAGResponse(answer=answer, sources=sources, query=question, usage=usage)
 
     def stream(
         self,
@@ -403,7 +452,13 @@ class RAG:
             question, top_k=top_k, min_score=min_score, where=where, hybrid=hybrid
         )
         messages = self._build_messages(question, sources)
-        yield from self.llm.stream(messages, **llm_kwargs)
+        tokens: list[str] = []
+        for token in self.llm.stream(messages, **llm_kwargs):
+            tokens.append(token)
+            yield token
+        if self.on_generate is not None:
+            usage = dict(getattr(self.llm, "last_usage", None) or {})
+            self._safe_callback(self.on_generate, question, "".join(tokens), usage)
 
     # ------------------------------------------------------------------- batch
     def retrieve_many(
@@ -503,32 +558,54 @@ class RAG:
             yield item
 
     # ----------------------------------------------------------- persistence
-    def save(self, path: str | Path) -> None:
+    def _config_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_size": self.chunk_size,
+            "chunk_overlap": self.chunk_overlap,
+            "top_k": self.top_k,
+            "system_prompt": self.system_prompt,
+            "use_mmr": self.use_mmr,
+            "use_hybrid": self.use_hybrid,
+            "min_score": self.min_score,
+            "max_context_tokens": self.max_context_tokens,
+            "dedup": self.dedup,
+        }
+
+    def save(self, path: str | Path, *, format: str | None = None) -> None:
         """Persist the index (chunks + embeddings) to ``path``.
 
-        Providers aren't pickled, reload with the same ``embedding_model`` /
+        Formats:
+
+        * ``"safe"`` (default): a pickle-free zip (``meta.json`` + ``matrix.npy``)
+          that is safe to share and load from untrusted sources.
+        * ``"pickle"``: the legacy format, selected automatically for ``.pkl`` /
+          ``.pickle`` paths for backward compatibility.
+
+        Providers aren't persisted; reload with the same ``embedding_model`` /
         ``llm_model`` you used originally.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "format_version": _SAVE_FORMAT_VERSION,
-            "chunks": self.store._chunks,
-            "matrix": self.store._matrix,
-            "config": {
-                "chunk_size": self.chunk_size,
-                "chunk_overlap": self.chunk_overlap,
-                "top_k": self.top_k,
-                "system_prompt": self.system_prompt,
-                "use_mmr": self.use_mmr,
-                "use_hybrid": self.use_hybrid,
-                "min_score": self.min_score,
-                "max_context_tokens": self.max_context_tokens,
-                "dedup": self.dedup,
-            },
-        }
-        with open(path, "wb") as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        if format is None:
+            format = "pickle" if path.suffix.lower() in (".pkl", ".pickle") else "safe"
+
+        if format in ("safe", "zip", "npz"):
+            from .persistence import save_safe
+
+            save_safe(path, self.store._matrix, self.store._chunks, self._config_dict())
+        elif format in ("pickle", "pkl"):
+            payload = {
+                "format_version": _SAVE_FORMAT_VERSION,
+                "chunks": self.store._chunks,
+                "matrix": self.store._matrix,
+                "config": self._config_dict(),
+            }
+            with open(path, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        else:
+            raise ConfigurationError(
+                f"Unknown save format {format!r}. Use 'safe' (default) or 'pickle'."
+            )
 
     @classmethod
     def load(
@@ -541,35 +618,97 @@ class RAG:
     ) -> RAG:
         """Load an index saved by :meth:`save`.
 
-        Security note: this uses ``pickle``; only load files you created/trust.
+        The format is auto-detected. The default ``"safe"`` format carries no
+        executable payload. Legacy pickle files are still read for compatibility;
+        only load pickle files you created or trust.
         """
+        from .persistence import SAFE_FORMAT_VERSION, is_safe_file, load_safe
+
+        path = Path(path)
+        if is_safe_file(path):
+            data = load_safe(path)
+            version = data["format_version"]
+            if version > SAFE_FORMAT_VERSION:
+                raise ConfigurationError(
+                    f"Index was saved with a newer swiftrag format (v{version}); "
+                    f"this version supports up to v{SAFE_FORMAT_VERSION}. Please upgrade swiftrag."
+                )
+            return cls._rehydrate(
+                data["config"], data["chunks"], data["matrix"],
+                embedding_model=embedding_model, llm_model=llm_model, **kwargs,
+            )
+
         with open(path, "rb") as f:
-            payload = pickle.load(f)
+            payload = pickle.load(f)  # noqa: S301 (legacy format; documented trust requirement)
         version = payload.get("format_version", 1)
         if version > _SAVE_FORMAT_VERSION:
             raise ConfigurationError(
                 f"Index was saved with a newer swiftrag format (v{version}); "
                 f"this version supports up to v{_SAVE_FORMAT_VERSION}. Please upgrade swiftrag."
             )
-        cfg = payload.get("config", {})
+        return cls._rehydrate(
+            payload.get("config", {}), payload["chunks"], payload["matrix"],
+            embedding_model=embedding_model, llm_model=llm_model, **kwargs,
+        )
+
+    @classmethod
+    def _rehydrate(
+        cls,
+        config: dict[str, Any],
+        chunks: list[Chunk],
+        matrix: np.ndarray | None,
+        *,
+        embedding_model: str | EmbeddingProvider,
+        llm_model: str | LLMProvider | None,
+        **kwargs,
+    ) -> RAG:
+        """Build a :class:`RAG` from a persisted (config, chunks, matrix) triple."""
         rag = cls(
             embedding_model=embedding_model,
             llm_model=llm_model,
-            chunk_size=cfg.get("chunk_size", 512),
-            chunk_overlap=cfg.get("chunk_overlap", 64),
-            top_k=cfg.get("top_k", 4),
-            system_prompt=cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
-            use_mmr=cfg.get("use_mmr", False),
-            use_hybrid=cfg.get("use_hybrid", False),
-            min_score=cfg.get("min_score"),
-            max_context_tokens=cfg.get("max_context_tokens"),
-            dedup=cfg.get("dedup", True),
+            chunk_size=config.get("chunk_size", 512),
+            chunk_overlap=config.get("chunk_overlap", 64),
+            top_k=config.get("top_k", 4),
+            system_prompt=config.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
+            use_mmr=config.get("use_mmr", False),
+            use_hybrid=config.get("use_hybrid", False),
+            min_score=config.get("min_score"),
+            max_context_tokens=config.get("max_context_tokens"),
+            dedup=config.get("dedup", True),
             **kwargs,
         )
-        rag.store._chunks = payload["chunks"]
-        rag.store._matrix = payload["matrix"]
+        rag.store._chunks = list(chunks)
+        rag.store._matrix = matrix
+        if matrix is not None:
+            for i, chunk in enumerate(rag.store._chunks):
+                chunk.embedding = matrix[i]
         rag._seen_hashes = {_text_hash(c.text) for c in rag.store._chunks}
         return rag
+
+    # ------------------------------------------------------------------- chat
+    def chat(
+        self,
+        *,
+        rewrite_queries: bool = True,
+        max_history_turns: int | None = 6,
+        system_prompt: str | None = None,
+    ) -> Conversation:
+        """Start a multi-turn :class:`~swiftrag.chat.Conversation` over this index.
+
+        Example
+        -------
+        >>> chat = rag.chat()
+        >>> chat.ask("Who wrote the deployment guide?")
+        >>> chat.ask("And when was it last updated?")   # follow-up understood
+        """
+        from .chat import Conversation
+
+        return Conversation(
+            self,
+            rewrite_queries=rewrite_queries,
+            max_history_turns=max_history_turns,
+            system_prompt=system_prompt,
+        )
 
     # ------------------------------------------------------------------- misc
     def __len__(self) -> int:
