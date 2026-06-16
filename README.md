@@ -38,9 +38,13 @@ pip install swiftrag                 # core (numpy only), works offline
 pip install "swiftrag[openai]"       # OpenAI embeddings and LLM
 pip install "swiftrag[anthropic]"    # Claude LLM
 pip install "swiftrag[local]"        # local sentence-transformers embeddings
+pip install "swiftrag[cohere]"       # Cohere embeddings
+pip install "swiftrag[gemini]"       # Google Gemini embeddings and LLM
 pip install "swiftrag[loaders]"      # PDF, DOCX, and richer HTML/URL loading
 pip install "swiftrag[faiss]"        # FAISS backend for big corpora
 pip install "swiftrag[all]"          # everything
+
+# Ollama needs no extra package — just a running Ollama server.
 ```
 
 ## Usage
@@ -54,9 +58,20 @@ RAG(documents=text, embedding_model="openai:text-embedding-3-small", llm_model="
 # Anthropic for generation, local embeddings (no embedding API calls)
 RAG(documents=text, embedding_model="local:all-MiniLM-L6-v2", llm_model="anthropic:claude-3-5-sonnet-latest")
 
+# Google Gemini, or Cohere embeddings
+RAG(documents=text, embedding_model="cohere:embed-english-v3.0", llm_model="gemini:gemini-1.5-flash")
+
+# Fully local and free via Ollama (no API keys, no extra packages)
+RAG(documents=text, embedding_model="ollama:nomic-embed-text", llm_model="ollama:llama3")
+
 # Fully offline (default), no keys required
 RAG(documents=text)
 ```
+
+Supported provider prefixes: embeddings — `openai`, `local`/`st`, `ollama`,
+`cohere`, `gemini`, `hash` (offline default); LLMs — `openai`, `anthropic`,
+`ollama`, `gemini`, `echo` (offline default). Set `OLLAMA_HOST` to target a
+remote Ollama server.
 
 ### Build straight from files, PDFs, or the web
 
@@ -153,15 +168,51 @@ def my_reranker(query, hits):
 rag = RAG(documents=docs, use_hybrid=True, reranker=my_reranker)
 ```
 
-### Add documents incrementally, save, and reload
+### Add, update, and delete documents
 
 ```python
 rag = RAG().add("first batch").add("second batch")
-rag.save("index.pkl")
 
-rag = RAG.load("index.pkl", embedding_model="openai:text-embedding-3-small",
+# Delete by metadata filter (or a Chunk -> bool predicate). Returns the count removed.
+rag.delete({"source": "outdated.pdf"})
+
+# Update = delete matching + add fresh (handy when a source changes).
+rag.update("the new handbook text", where={"source": "handbook"})
+```
+
+### Save and reload (pickle-free by default)
+
+```python
+rag.save("index.swiftrag")          # safe zip format (meta.json + matrix.npy)
+rag = RAG.load("index.swiftrag", embedding_model="openai:text-embedding-3-small",
                llm_model="openai:gpt-4o-mini")
 ```
+
+The default `"safe"` format carries no executable payload, so it's safe to
+share and load from untrusted sources. The format is auto-detected on load, and
+the legacy pickle format still works (`.pkl`/`.pickle` paths use it
+automatically, or pass `format="pickle"`).
+
+### Multi-turn conversations
+
+`rag.chat()` returns a stateful conversation that remembers history and rewrites
+follow-ups into standalone queries before retrieval, so references like "it" or
+"that" resolve correctly across turns.
+
+```python
+chat = rag.chat()
+print(chat.ask("Who owns the deployment runbook?").answer)
+print(chat.ask("And when was it last updated?").answer)  # "it" understood from context
+
+for token in chat.stream("Summarize what we just discussed."):
+    print(token, end="", flush=True)
+
+chat.reset()   # clear history, keep the index
+```
+
+Query rewriting uses the configured LLM and is skipped automatically in offline
+mode. Disable it with `rag.chat(rewrite_queries=False)`, and cap remembered
+turns with `max_history_turns`.
 
 ### Batch and async
 
@@ -197,12 +248,63 @@ rag = RAG(documents=text, llm_model=lambda prompt: my_model.generate(prompt))
 | `use_mmr` | `False` | Maximal Marginal Relevance re-ranking for diverse results. |
 | `use_hybrid` | `False` | Fuse dense + BM25 lexical ranking with Reciprocal Rank Fusion. |
 | `reranker` | `None` | Optional `(query, sources) -> sources` callable applied after retrieval. |
+| `on_retrieve` | `None` | Hook `(query, sources) -> None` called after retrieval. |
+| `on_generate` | `None` | Hook `(query, answer, usage) -> None` called after generation. |
 | `use_faiss` | `False` | Use FAISS index (install `swiftrag[faiss]`). |
 | `min_score` | `None` | Default cosine threshold for dropping weak matches. |
 | `max_context_tokens` | `None` | Cap the tokens of retrieved context packed into the prompt. |
 | `dedup` | `True` | Skip exact-duplicate chunks on ingest. |
 | `query_cache_size` | `128` | LRU size for cached query embeddings (`0` disables). |
 | `system_prompt` | grounded default | System prompt for the LLM. |
+
+## Production niceties
+
+Provider API calls (OpenAI, Anthropic, Gemini, Cohere, Ollama) are automatically
+retried with exponential backoff and jitter on transient failures. Tune it per
+provider with `max_retries`:
+
+```python
+RAG(documents=docs, llm_model="openai:gpt-4o-mini", llm_kwargs={"max_retries": 5})
+```
+
+Token usage is attached to each response when the provider reports it, and you
+can hook into retrieval and generation for logging, tracing, or cost tracking:
+
+```python
+resp = rag.query("...")
+print(resp.usage)   # e.g. {"prompt_tokens": 812, "completion_tokens": 95, ...}
+
+rag = RAG(
+    documents=docs,
+    llm_model="openai:gpt-4o-mini",
+    on_retrieve=lambda q, sources: log.info("retrieved %d chunks for %r", len(sources), q),
+    on_generate=lambda q, answer, usage: meter.record(usage),
+)
+```
+
+Hooks are best-effort: an exception inside a callback is logged and never breaks
+the query.
+
+## Evaluation
+
+Tune your pipeline with a small labelled set instead of guessing. `evaluate_retrieval`
+reports hit-rate, MRR, and precision@k, and `groundedness` estimates how well an
+answer is supported by its sources.
+
+```python
+from swiftrag import evaluate_retrieval, groundedness
+
+examples = [
+    {"query": "What's our refund window?", "relevant": ["handbook"]},  # match by metadata source
+    {"query": "How do we deploy?", "relevant": ["runbook"]},
+]
+report = evaluate_retrieval(rag, examples, top_k=5)
+print(report)   # RetrievalReport(n=2, top_k=5, hit_rate=1.000, mrr=0.875, precision=0.300)
+
+resp = rag.query("What's our refund window?")
+print(groundedness(resp.answer, resp.sources))   # 0.0–1.0 lexical-coverage estimate
+# Pass llm=... for a model-judged groundedness score instead.
+```
 
 ## How it works
 

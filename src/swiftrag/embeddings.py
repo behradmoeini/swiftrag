@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from ._retry import DEFAULT_MAX_RETRIES, retry_call
 from .exceptions import ConfigurationError, DependencyError
 
 
@@ -84,6 +85,7 @@ class OpenAIEmbeddings(EmbeddingProvider):
         batch_size: int = 128,
         max_workers: int = 4,
         dimensions: int | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         try:
             from openai import OpenAI
@@ -94,6 +96,7 @@ class OpenAIEmbeddings(EmbeddingProvider):
         self.batch_size = batch_size
         self.max_workers = max_workers
         self.dimensions = dimensions
+        self.max_retries = max_retries
         self._client = OpenAI(
             api_key=api_key or os.getenv("OPENAI_API_KEY"),
             base_url=base_url or os.getenv("OPENAI_BASE_URL"),
@@ -103,7 +106,9 @@ class OpenAIEmbeddings(EmbeddingProvider):
         kwargs = {"model": self.model, "input": list(batch)}
         if self.dimensions:
             kwargs["dimensions"] = self.dimensions
-        resp = self._client.embeddings.create(**kwargs)
+        resp = retry_call(
+            lambda: self._client.embeddings.create(**kwargs), retries=self.max_retries
+        )
         data = sorted(resp.data, key=lambda d: d.index)
         return np.asarray([d.embedding for d in data], dtype=np.float32)
 
@@ -159,6 +164,135 @@ class SentenceTransformerEmbeddings(EmbeddingProvider):
         return np.ascontiguousarray(arr, dtype=np.float32)
 
 
+class OllamaEmbeddings(EmbeddingProvider):
+    """Embeddings via a local (or remote) Ollama server. No extra dependencies.
+
+    Talks to Ollama's HTTP API directly, so a fully offline, free embedding +
+    LLM stack works with just the core install. Point at a different host with
+    the ``OLLAMA_HOST`` environment variable or the ``host`` argument.
+    """
+
+    def __init__(
+        self,
+        model: str = "nomic-embed-text",
+        *,
+        host: str | None = None,
+        timeout: float = 60.0,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+    ) -> None:
+        self.model = model
+        self.host = (host or os.getenv("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
+
+    def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
+        from ._http import post_json
+
+        if not texts:
+            return np.empty((0, self.dim or 1), dtype=np.float32)
+        data = retry_call(
+            lambda: post_json(
+                f"{self.host}/api/embed",
+                {"model": self.model, "input": list(texts)},
+                timeout=self.timeout,
+            ),
+            retries=self.max_retries,
+        )
+        embeddings = data.get("embeddings")
+        if not embeddings:
+            raise ConfigurationError(
+                f"Ollama returned no embeddings for model '{self.model}'. "
+                f"Is it pulled? Try:  ollama pull {self.model}"
+            )
+        arr = np.asarray(embeddings, dtype=np.float32)
+        self.dim = arr.shape[1]
+        return arr
+
+
+class CohereEmbeddings(EmbeddingProvider):
+    """Cohere embeddings (needs ``cohere``).
+
+    Uses the correct ``input_type`` for documents vs. queries, which Cohere's
+    retrieval models are trained to distinguish.
+    """
+
+    def __init__(
+        self,
+        model: str = "embed-english-v3.0",
+        *,
+        api_key: str | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+    ) -> None:
+        try:
+            import cohere
+        except ImportError as e:
+            raise DependencyError("cohere", "cohere") from e
+        self.model = model
+        self.max_retries = max_retries
+        self._client = cohere.Client(api_key or os.getenv("COHERE_API_KEY"))
+
+    def _embed(self, texts: Sequence[str], input_type: str) -> np.ndarray:
+        resp = retry_call(
+            lambda: self._client.embed(
+                texts=list(texts), model=self.model, input_type=input_type
+            ),
+            retries=self.max_retries,
+        )
+        arr = np.asarray(resp.embeddings, dtype=np.float32)
+        self.dim = arr.shape[1]
+        return arr
+
+    def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.dim or 1), dtype=np.float32)
+        return self._embed(texts, "search_document")
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return self._embed([text], "search_query")[0]
+
+
+class GeminiEmbeddings(EmbeddingProvider):
+    """Google Gemini embeddings (needs ``google-generativeai``)."""
+
+    def __init__(
+        self,
+        model: str = "text-embedding-004",
+        *,
+        api_key: str | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+    ) -> None:
+        try:
+            import google.generativeai as genai
+        except ImportError as e:
+            raise DependencyError("google-generativeai", "gemini") from e
+        genai.configure(api_key=api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
+        self._genai = genai
+        self.max_retries = max_retries
+        self.model = model if model.startswith("models/") else f"models/{model}"
+
+    def embed_documents(self, texts: Sequence[str]) -> np.ndarray:
+        if not texts:
+            return np.empty((0, self.dim or 1), dtype=np.float32)
+        resp = retry_call(
+            lambda: self._genai.embed_content(
+                model=self.model, content=list(texts), task_type="retrieval_document"
+            ),
+            retries=self.max_retries,
+        )
+        arr = np.asarray(resp["embedding"], dtype=np.float32)
+        self.dim = arr.shape[1]
+        return arr
+
+    def embed_query(self, text: str) -> np.ndarray:
+        resp = retry_call(
+            lambda: self._genai.embed_content(
+                model=self.model, content=text, task_type="retrieval_query"
+            ),
+            retries=self.max_retries,
+        )
+        return np.asarray(resp["embedding"], dtype=np.float32)
+
+
 def resolve_embeddings(spec, **kwargs) -> EmbeddingProvider:
     """Build an :class:`EmbeddingProvider` from a spec.
 
@@ -183,12 +317,18 @@ def resolve_embeddings(spec, **kwargs) -> EmbeddingProvider:
         return OpenAIEmbeddings(model or "text-embedding-3-small", **kwargs)
     if provider in ("st", "local", "sentence-transformers", "hf"):
         return SentenceTransformerEmbeddings(model or "all-MiniLM-L6-v2", **kwargs)
+    if provider in ("ollama",):
+        return OllamaEmbeddings(model or "nomic-embed-text", **kwargs)
+    if provider in ("cohere", "co"):
+        return CohereEmbeddings(model or "embed-english-v3.0", **kwargs)
+    if provider in ("gemini", "google", "googleai"):
+        return GeminiEmbeddings(model or "text-embedding-004", **kwargs)
     if provider in ("hash", "none", "offline"):
         dim = int(model) if model.isdigit() else kwargs.get("dim", 512)
         return HashEmbeddings(dim=dim)
     raise ConfigurationError(
-        f"Unknown embedding provider '{provider}'. "
-        "Use one of: openai, st/local, hash, or pass a custom provider object."
+        f"Unknown embedding provider '{provider}'. Use one of: openai, st/local, "
+        "ollama, cohere, gemini, hash, or pass a custom provider object."
     )
 
 
@@ -197,5 +337,8 @@ __all__ = [
     "HashEmbeddings",
     "OpenAIEmbeddings",
     "SentenceTransformerEmbeddings",
+    "OllamaEmbeddings",
+    "CohereEmbeddings",
+    "GeminiEmbeddings",
     "resolve_embeddings",
 ]
