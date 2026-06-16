@@ -302,6 +302,14 @@ class RAG:
         return vec
 
     # --------------------------------------------------------------- retrieval
+    def _maybe_rerank(
+        self, question: str, results: list[ScoredChunk], top_k: int
+    ) -> list[ScoredChunk]:
+        """Apply the optional reranker, then cap to ``top_k``."""
+        if self.reranker is not None and results:
+            results = list(self.reranker(question, results))
+        return results[:top_k]
+
     def retrieve(
         self,
         question: str,
@@ -309,6 +317,7 @@ class RAG:
         *,
         min_score: float | None = None,
         where: Where | None = None,
+        hybrid: bool | None = None,
     ) -> list[ScoredChunk]:
         """Return the most relevant chunks for ``question`` (no generation).
 
@@ -317,17 +326,24 @@ class RAG:
             min_score: Drop chunks whose cosine score is below this threshold.
             where: Metadata filter, a dict of exact ``key == value`` matches or
                 a ``Chunk -> bool`` predicate.
+            hybrid: Override the instance ``use_hybrid`` setting for this call.
+                When on, dense and BM25 rankings are fused with Reciprocal Rank
+                Fusion (helps exact-term matches the embedder misses).
         """
         if len(self.store) == 0:
             raise EmptyCorpusError("No documents indexed. Call .add(...) or pass documents=...")
+        effective_k = top_k or self.top_k
         q_emb = self._embed_query_cached(question)
-        return self.store.search(
+        results = self.store.search(
             q_emb,
-            top_k=top_k or self.top_k,
+            top_k=effective_k,
             mmr=self.use_mmr,
             min_score=self.min_score if min_score is None else min_score,
             predicate=_make_predicate(where),
+            hybrid=self.use_hybrid if hybrid is None else hybrid,
+            query_text=question,
         )
+        return self._maybe_rerank(question, results, effective_k)
 
     # -------------------------------------------------------------- generation
     def _fit_to_budget(self, sources: list[ScoredChunk]) -> list[ScoredChunk]:
@@ -361,10 +377,13 @@ class RAG:
         top_k: int | None = None,
         min_score: float | None = None,
         where: Where | None = None,
+        hybrid: bool | None = None,
         **llm_kwargs,
     ) -> RAGResponse:
         """Retrieve relevant context and generate a grounded answer."""
-        sources = self.retrieve(question, top_k=top_k, min_score=min_score, where=where)
+        sources = self.retrieve(
+            question, top_k=top_k, min_score=min_score, where=where, hybrid=hybrid
+        )
         messages = self._build_messages(question, sources)
         answer = self.llm.generate(messages, **llm_kwargs)
         return RAGResponse(answer=answer, sources=sources, query=question)
@@ -376,10 +395,13 @@ class RAG:
         top_k: int | None = None,
         min_score: float | None = None,
         where: Where | None = None,
+        hybrid: bool | None = None,
         **llm_kwargs,
     ) -> Iterator[str]:
         """Like :meth:`query`, but yields answer tokens as they arrive."""
-        sources = self.retrieve(question, top_k=top_k, min_score=min_score, where=where)
+        sources = self.retrieve(
+            question, top_k=top_k, min_score=min_score, where=where, hybrid=hybrid
+        )
         messages = self._build_messages(question, sources)
         yield from self.llm.stream(messages, **llm_kwargs)
 
@@ -391,25 +413,32 @@ class RAG:
         top_k: int | None = None,
         min_score: float | None = None,
         where: Where | None = None,
+        hybrid: bool | None = None,
     ) -> list[list[ScoredChunk]]:
         """Retrieve for many questions, embedding them all in one batched call."""
         if not questions:
             return []
         if len(self.store) == 0:
             raise EmptyCorpusError("No documents indexed. Call .add(...) or pass documents=...")
-        embeddings = self.embedder.embed_documents(list(questions))
+        questions = list(questions)
+        embeddings = self.embedder.embed_documents(questions)
         predicate = _make_predicate(where)
         effective_min = self.min_score if min_score is None else min_score
-        return [
-            self.store.search(
+        effective_k = top_k or self.top_k
+        effective_hybrid = self.use_hybrid if hybrid is None else hybrid
+        results = []
+        for question, emb in zip(questions, embeddings):
+            hits = self.store.search(
                 emb,
-                top_k=top_k or self.top_k,
+                top_k=effective_k,
                 mmr=self.use_mmr,
                 min_score=effective_min,
                 predicate=predicate,
+                hybrid=effective_hybrid,
+                query_text=question,
             )
-            for emb in embeddings
-        ]
+            results.append(self._maybe_rerank(question, hits, effective_k))
+        return results
 
     def query_many(
         self,
@@ -418,13 +447,14 @@ class RAG:
         top_k: int | None = None,
         min_score: float | None = None,
         where: Where | None = None,
+        hybrid: bool | None = None,
         max_workers: int = 4,
         **llm_kwargs,
     ) -> list[RAGResponse]:
         """Answer many questions. Embeddings are batched; generation is parallelized."""
         questions = list(questions)
         sources_list = self.retrieve_many(
-            questions, top_k=top_k, min_score=min_score, where=where
+            questions, top_k=top_k, min_score=min_score, where=where, hybrid=hybrid
         )
 
         def _answer(item: tuple[str, list[ScoredChunk]]) -> RAGResponse:
@@ -491,6 +521,7 @@ class RAG:
                 "top_k": self.top_k,
                 "system_prompt": self.system_prompt,
                 "use_mmr": self.use_mmr,
+                "use_hybrid": self.use_hybrid,
                 "min_score": self.min_score,
                 "max_context_tokens": self.max_context_tokens,
                 "dedup": self.dedup,
@@ -529,6 +560,7 @@ class RAG:
             top_k=cfg.get("top_k", 4),
             system_prompt=cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT),
             use_mmr=cfg.get("use_mmr", False),
+            use_hybrid=cfg.get("use_hybrid", False),
             min_score=cfg.get("min_score"),
             max_context_tokens=cfg.get("max_context_tokens"),
             dedup=cfg.get("dedup", True),

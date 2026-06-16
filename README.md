@@ -127,6 +127,32 @@ resp = rag.query(
 Repeated queries reuse a cached query embedding (LRU, configurable via
 `query_cache_size`), so re-asking the same question skips the embedding call.
 
+### Hybrid search and reranking
+
+Dense embeddings capture meaning but often miss exact-term matches (names, IDs,
+error codes, rare words). Turn on hybrid retrieval to fuse dense similarity with
+a built-in BM25 lexical score using Reciprocal Rank Fusion. It needs no extra
+dependencies and noticeably helps the offline hash embedder too.
+
+```python
+rag = RAG(documents=docs, use_hybrid=True)
+rag.query("error code E1042")        # exact tokens now pull their way up
+
+# Or decide per call:
+rag.retrieve("Zorblax42", hybrid=True)
+```
+
+Need a stronger final ordering? Plug in any reranker — a callable
+`(query, list[ScoredChunk]) -> list[ScoredChunk]` runs after retrieval:
+
+```python
+def my_reranker(query, hits):
+    # e.g. a cross-encoder or a hosted rerank API; return reordered hits
+    return sorted(hits, key=lambda h: my_cross_encoder(query, h.text), reverse=True)
+
+rag = RAG(documents=docs, use_hybrid=True, reranker=my_reranker)
+```
+
 ### Add documents incrementally, save, and reload
 
 ```python
@@ -169,6 +195,8 @@ rag = RAG(documents=text, llm_model=lambda prompt: my_model.generate(prompt))
 | `chunk_overlap` | `64` | Token overlap between chunks. |
 | `top_k` | `4` | Chunks retrieved per query. |
 | `use_mmr` | `False` | Maximal Marginal Relevance re-ranking for diverse results. |
+| `use_hybrid` | `False` | Fuse dense + BM25 lexical ranking with Reciprocal Rank Fusion. |
+| `reranker` | `None` | Optional `(query, sources) -> sources` callable applied after retrieval. |
 | `use_faiss` | `False` | Use FAISS index (install `swiftrag[faiss]`). |
 | `min_score` | `None` | Default cosine threshold for dropping weak matches. |
 | `max_context_tokens` | `None` | Cap the tokens of retrieved context packed into the prompt. |
